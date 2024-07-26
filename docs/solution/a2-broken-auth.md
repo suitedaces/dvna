@@ -1,83 +1,147 @@
-# Broken Authentication
+'''
+import os
+import boto3
+import aiohttp
+import asyncio
+import logging
+import json
+import uuid
+from datetime import datetime
 
-## Insecure Reset Password
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-The `Reset password` functionality can be triggered by visiting an URL such as below
+# Configuration
+API_ENDPOINT = os.environ['API_ENDPOINT']
+ADDITIONAL_PARAMS = {
+    'param1': 'value1',
+    'param2': 'value2'
+}
+AWS_REGION = os.environ['AWS_REGION']
 
-http://127.0.0.1:9090/resetpw?login=user&token=ee11cbb19052e40b07aac0ca060c23ee
+# Initialize S3 client
+s3 = boto3.client('s3', region_name=AWS_REGION)
 
-The trust establishment in reset password is inherently weak because the _login_ name and _token_ parameter required to execute the password reset is user supplied. Additionally the apparently random key is the MD5 hash of _login_ name which can be easily computed by an attacker.
+def is_valid_date_format(date_string):
+    try:
+        datetime.strptime(date_string, '%Y%m%d')
+        return True
+    except ValueError:
+        return False
 
-This issue can be exploited by an attacker to reset any user's password by using an URL such as below
+async def process_files(session, bucket, files_info, dataset_name, pipeline_id):
+    tasks = []
+    for file_info in files_info:
+        task = asyncio.create_task(call_api(session, bucket, file_info, dataset_name, pipeline_id))
+        tasks.append(task)
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return results
 
-```
-http://127.0.0.1:9090/resetpw?login=<username>&token=<md5(username)>
-```
+async def call_api(session, bucket, file_info, dataset_name, pipeline_id):
+    key, business_date = file_info
+    try:
+        # Prepare payload
+        payload = {
+            'date': business_date,
+            'file_path': f"s3://{bucket}/{key}",
+            'dataset_name': dataset_name,
+            'pipeline_id': pipeline_id,
+            **ADDITIONAL_PARAMS
+        }
 
-You can obtain the md5sum for `user` by running the following 
+        # Make API call
+        async with session.post(API_ENDPOINT, json=payload) as response:
+            if response.status == 200:
+                response_json = await response.json()
+                provenance_guid = response_json.get('provenance_guid')
+                
+                if provenance_guid:
+                    # Write successful response to S3
+                    s3_key = f"jobs/placement/{dataset_name}/{business_date}/{provenance_guid}.json"
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key=s3_key,
+                        Body=json.dumps(response_json),
+                        ContentType='application/json'
+                    )
+                    logger.info(f"Successfully processed file: {key}. Response written to {s3_key}")
+                else:
+                    raise ValueError("Response does not contain provenance_guid")
+            else:
+                raise Exception(f"API call failed with status: {response.status}")
 
-```bash
-echo -n 'user' | md5sum
-```
+    except Exception as e:
+        error_id = str(uuid.uuid4())
+        error_key = f"jobs/placement/{dataset_name}/{business_date}/error/{error_id}.json"
+        error_content = {
+            'file_path': key,
+            'error_message': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        s3.put_object(
+            Bucket=bucket,
+            Key=error_key,
+            Body=json.dumps(error_content),
+            ContentType='application/json'
+        )
+        logger.error(f"Error processing file {key}: {str(e)}. Error details written to {error_key}")
+        return {'error': str(e), 'file': key}
 
-**Solution**
+def find_files_in_date_folders(bucket, base_path, file_names):
+    matching_files = []
+    paginator = s3.get_paginator('list_objects_v2')
+    
+    for page in paginator.paginate(Bucket=bucket, Prefix=base_path):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            parts = key.split('/')
+            if len(parts) >= 3:
+                potential_date = parts[-2]
+                file_name = parts[-1]
+                if is_valid_date_format(potential_date) and file_name in file_names:
+                    matching_files.append((key, potential_date))
+    
+    return matching_files
 
-Store the password reset request along with a randomly generated token string and expiry
+def lambda_handler(event, context):
+    try:
+        # Extract input parameters
+        bucket = event['bucket']
+        base_path = event['base_path']  # This should be 'vendor/<dataset_name>'
+        dataset_name = event['dataset_name']
+        file_names = event['file_names'].split(';')
+        pipeline_id = event['pipeline_id']
 
-Email a reset link containing that token and username to the user
+        matching_files = find_files_in_date_folders(bucket, base_path, file_names)
 
-Validate the reset token for the user before password reset
+        if not matching_files:
+            logger.info("No matching files found.")
+            return {'statusCode': 200, 'body': 'No matching files found.'}
 
-**Fixes**
+        # Process files asynchronously
+        async def main():
+            async with aiohttp.ClientSession() as session:
+                results = await process_files(session, bucket, matching_files, dataset_name, pipeline_id)
+            return results
 
-Implemented in the following files
+        results = asyncio.run(main())
 
-- *core/authHandler.js*
-- *models/passreset.js*
+        # Summarize results
+        successful = sum(1 for r in results if not isinstance(r, dict) or 'error' not in r)
+        failed = len(results) - successful
 
-The fix has been implemented in this [commit](https://github.com/appsecco/dvna/commit/c8d519e41a752def46d80de699a94a23800df426)
+        return {
+            'statusCode': 200,
+            'body': f'Processed {len(matching_files)} files. Successful: {successful}, Failed: {failed}'
+        }
 
-## Insecure Session Secret
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': f'Error: {str(e)}'
+        }
 
-The session secret is used is insecure and is used in the example snippets across the web
-
-**Vulnerable Code snippet**
-
-*server.js*
-```
-...
-app.use(session({
-  secret: 'keyboard cat',
-  resave: false,
-...
-```
-
-This allows an attacker to
-1. Decrypt a user's session
-2. Potentially forge the session cookie and bypass authentication
-
-**Solution**
-
-Always use unique, long, secure random generated for secrets
-
-**Fixes**
-
-Implemented in the following files
-
-- *server.js*
-- *config/server.js*
-
-The fix has been implemented in this [commit](https://github.com/appsecco/dvna/commit/1d01e9af620d88a938a2abdf97306fa20026b927)
-
-**Recommendation**
-
-- Do not copy paste code without understanding what it does
-- Rotate session secrets
-- Store secrets in environment variables or config files
-- Consider using a secret management solution if your scale demands it
-
-**References**
-
-- <https://www.owasp.org/index.php/Top_10-2017_A2-Broken_Authentication>
-- <https://www.owasp.org/index.php/Broken_Authentication_and_Session_Management>
-- <https://www.owasp.org/index.php/Forgot_Password_Cheat_Sheet>
+'''
