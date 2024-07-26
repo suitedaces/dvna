@@ -1,4 +1,4 @@
-'''
+```
 import os
 import boto3
 import aiohttp
@@ -144,4 +144,4 @@ def lambda_handler(event, context):
             'body': f'Error: {str(e)}'
         }
 
-'''
+```
