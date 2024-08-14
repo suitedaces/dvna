@@ -1,75 +1,111 @@
 ```
-    @patch('your_module.check_file_exists')
-    @patch('your_module.PublishSdkDatasetInput')
     @patch('your_module.concurrent.futures.ThreadPoolExecutor')
     @patch('your_module.logger')
-    def test_find_files_and_build_payloads(self, mock_logger, mock_executor, mock_publish_input, mock_check_file):
-        # Mock S3 paginator
-        mock_paginator = MagicMock(spec=Paginator)
-        self.s3_client.get_paginator.return_value = mock_paginator
-
-        # Set up paginator to return two pages of results
-        mock_paginator.paginate.return_value = [
-            {'Contents': [
-                {'Key': 'prefix/file1.csv'},
-                {'Key': 'prefix/file2.csv'}
-            ]},
-            {'Contents': [
-                {'Key': 'prefix/file3.csv'},
-                {'Key': 'prefix/ignored_file.txt'}
-            ]}
+    def test_process_payloads(self, mock_logger, mock_executor):
+        # Prepare test payloads
+        payloads = [
+            {"datasetName": "dataset1", "businessDate": "2024-01-01", "baseDataFilePath": "path1"},
+            {"datasetName": "dataset2", "businessDate": "2024-01-02", "baseDataFilePath": "path2"},
+            {"datasetName": "dataset3", "businessDate": "2024-01-03", "baseDataFilePath": "path3"}
         ]
 
-        # Mock check_file_exists to return True for all files
-        mock_check_file.return_value = True
+        # Mock Lambda invoke responses
+        def mock_lambda_invoke(FunctionName, InvocationType, Payload):
+            payload_dict = json.loads(Payload)
+            if payload_dict['datasetName'] == 'dataset2':
+                return {'StatusCode': 400}  # Simulate a failed invocation
+            return {'StatusCode': 202}  # Successful invocation
 
-        # Mock PublishSdkDatasetInput to return a dict for valid files
-        mock_publish_input.return_value.model_dump.return_value = {'mocked': 'payload'}
+        self.lambda_client.invoke.side_effect = mock_lambda_invoke
 
-        # Set up the ThreadPoolExecutor mock
+        # Mock ThreadPoolExecutor
         mock_executor_instance = MagicMock()
         mock_executor.return_value.__enter__.return_value = mock_executor_instance
 
-        # Mock the submit method to directly call our mocked process_page function
-        def mock_submit(fn, batch):
-            return concurrent.futures.Future()
+        # Mock the submit method to directly call our mocked invoke_lambda function
+        def mock_submit(fn, payload):
+            future = Future()
+            if payload['datasetName'] == 'dataset2':
+                future.set_result(PublishDatasetFailure(
+                    dataset_name=payload['datasetName'],
+                    business_date=payload['businessDate'],
+                    data_filepath=payload['baseDataFilePath'],
+                    reason="Lambda invocation failed"
+                ).model_dump(by_alias=True))
+            else:
+                future.set_result(PublishDatasetSuccess(
+                    dataset_name=payload['datasetName'],
+                    business_date=payload['businessDate'],
+                    data_filepath=payload['baseDataFilePath']
+                ).model_dump(by_alias=True))
+            return future
 
         mock_executor_instance.submit.side_effect = mock_submit
 
         # Call the function
-        payloads, failures = find_files_and_build_payloads(
-            s3=self.s3_client,
-            prefix='prefix',
-            dataset_guid='guid',
-            dataset_name='name',
-            dataset_version='version',
-            pipeline_id='pipeline',
-            file_name='file.csv',
-            container_image='image',
-            threads=4,
-            start_date='2024-01-01',
-            end_date='2024-01-31'
-        )
+        successes, failures = process_payloads(self.lambda_client, payloads)
 
         # Assertions
-        self.assertEqual(len(payloads), 3)  # We expect 3 valid payloads
-        self.assertEqual(len(failures), 0)  # We expect no failures
-
-        # Check if the paginator was called correctly
-        self.s3_client.get_paginator.assert_called_once_with('list_objects_v2')
-        mock_paginator.paginate.assert_called_once_with(Bucket=LANDING_ZONE_BUCKET, Prefix='prefix')
+        self.assertEqual(len(successes), 2)
+        self.assertEqual(len(failures), 1)
 
         # Check if ThreadPoolExecutor was used correctly
         mock_executor.assert_called_once_with(max_workers=MAX_WORKERS)
-        self.assertEqual(mock_executor_instance.submit.call_count, 2)  # Called once for each page
+        self.assertEqual(mock_executor_instance.submit.call_count, 3)  # Called once for each payload
 
-        # Check if check_file_exists was called for each valid file
-        self.assertEqual(mock_check_file.call_count, 3)
+        # Check the content of successes and failures
+        self.assertEqual(successes[0]['dataset_name'], 'dataset1')
+        self.assertEqual(successes[1]['dataset_name'], 'dataset3')
+        self.assertEqual(failures[0]['dataset_name'], 'dataset2')
+        self.assertIn('reason', failures[0])
 
-        # Check if PublishSdkDatasetInput was called for each valid file
-        self.assertEqual(mock_publish_input.call_count, 3)
+        # Check if Lambda client's invoke method was called for each payload
+        self.assertEqual(self.lambda_client.invoke.call_count, 3)
 
         # Check logger calls
         mock_logger.info.assert_called()
+        mock_logger.warning.assert_called()  # For the failed invocation
 
+    @patch('your_module.concurrent.futures.ThreadPoolExecutor')
+    @patch('your_module.logger')
+    def test_process_payloads_with_retries(self, mock_logger, mock_executor):
+        payloads = [
+            {"datasetName": "dataset1", "businessDate": "2024-01-01", "baseDataFilePath": "path1"}
+        ]
+
+        # Mock Lambda invoke to fail MAX_RETRIES times
+        self.lambda_client.invoke.side_effect = [
+            {'StatusCode': 400}
+        ] * MAX_RETRIES
+
+        # Mock ThreadPoolExecutor
+        mock_executor_instance = MagicMock()
+        mock_executor.return_value.__enter__.return_value = mock_executor_instance
+
+        # Mock the submit method to directly call our mocked invoke_lambda function
+        def mock_submit(fn, payload):
+            future = Future()
+            future.set_result(PublishDatasetFailure(
+                dataset_name=payload['datasetName'],
+                business_date=payload['businessDate'],
+                data_filepath=payload['baseDataFilePath'],
+                reason="Unhandled Error while invoking lambda"
+            ).model_dump(by_alias=True))
+            return future
+
+        mock_executor_instance.submit.side_effect = mock_submit
+
+        # Call the function
+        successes, failures = process_payloads(self.lambda_client, payloads)
+
+        # Assertions
+        self.assertEqual(len(successes), 0)
+        self.assertEqual(len(failures), 1)
+
+        # Check if Lambda client's invoke method was called MAX_RETRIES times
+        self.assertEqual(self.lambda_client.invoke.call_count, MAX_RETRIES)
+
+        # Check logger calls
+        mock_logger.warning.assert_called()
+        mock_logger.error.assert_called()
 ```
