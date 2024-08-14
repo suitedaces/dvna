@@ -3,13 +3,14 @@ import unittest
 from unittest.mock import patch, MagicMock
 from typing import Dict, Any, List
 import json
+import concurrent.futures
 
 # Import the functions you want to test
 from your_module import (
     publish_multi_file_handler,
     find_files_and_build_payloads,
-    check_file_exists,
-    invoke_lambda
+    process_payloads,
+    check_file_exists
 )
 
 class TestDataProcessingPipeline(unittest.TestCase):
@@ -112,6 +113,39 @@ class TestDataProcessingPipeline(unittest.TestCase):
         }))
 
     @patch('your_module.boto3.client')
+    @patch('your_module.logger')
+    @patch('concurrent.futures.ThreadPoolExecutor')
+    def test_process_payloads(self, mock_executor, mock_logger, mock_boto3_client):
+        mock_lambda_client = mock_boto3_client.return_value
+        payloads = [
+            {'key': 'value1'},
+            {'key': 'value2'},
+            {'key': 'value3'}
+        ]
+
+        # Mock the internal invoke_lambda function
+        def mock_invoke_lambda(client, payload):
+            if payload['key'] == 'value2':
+                return {'success': False, 'error': 'Error processing payload2'}
+            return {'success': True, 'data': f'Processed {payload["key"]}'}
+
+        # Set up the mock executor to use our mock_invoke_lambda
+        mock_executor.return_value.__enter__.return_value.submit.side_effect = \
+            lambda f, client, payload: concurrent.futures.Future().set_result(mock_invoke_lambda(client, payload))
+
+        successes, failures = process_payloads(mock_lambda_client, payloads)
+
+        # Assertions
+        self.assertEqual(len(successes), 2)
+        self.assertEqual(len(failures), 1)
+
+        self.assertIn('Processed value1', str(successes[0]))
+        self.assertIn('Processed value3', str(successes[1]))
+        self.assertIn('Error processing payload2', str(failures[0]))
+
+        mock_logger.info.assert_called_with("Invoking lambda with payloads now...")
+
+    @patch('your_module.boto3.client')
     def test_check_file_exists(self, mock_boto3_client):
         s3 = mock_boto3_client.return_value
         bucket = "test-bucket"
@@ -150,38 +184,6 @@ class TestDataProcessingPipeline(unittest.TestCase):
 
         self.assertEqual(len(payloads), 0)
         self.assertEqual(len(failures), 0)
-
-    @patch('your_module.boto3.client')
-    @patch('your_module.logger')
-    def test_invoke_lambda(self, mock_logger, mock_boto3_client):
-        mock_lambda_client = mock_boto3_client.return_value
-        payload: Dict[str, Any] = {"key": "value"}
-
-        # Test successful invocation
-        mock_lambda_client.invoke.return_value = {
-            'StatusCode': 200,
-            'Payload': MagicMock(read=lambda: json.dumps({"status": "success"}).encode())
-        }
-
-        result = invoke_lambda(mock_lambda_client, payload)
-        self.assertTrue(result['success'])
-
-        # Test failed invocation
-        mock_lambda_client.invoke.return_value = {
-            'StatusCode': 400,
-            'Payload': MagicMock(read=lambda: json.dumps({"error": "Some error"}).encode())
-        }
-
-        result = invoke_lambda(mock_lambda_client, payload)
-        self.assertFalse(result['success'])
-        self.assertEqual(result['error'], "Some error")
-
-        # Test exception handling
-        mock_lambda_client.invoke.side_effect = Exception("Lambda invocation failed")
-
-        result = invoke_lambda(mock_lambda_client, payload)
-        self.assertFalse(result['success'])
-        self.assertIn("Lambda invocation failed", result['error'])
 
 if __name__ == '__main__':
     unittest.main()
