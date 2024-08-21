@@ -1,12 +1,10 @@
 ```
-
 import concurrent.futures
 from functools import partial
 import boto3
 import csv
-import gzip
-from io import StringIO, BytesIO
-import magic
+from io import StringIO
+from typing import Dict, List, Tuple, Set
 
 def group_files_by_columns(s3: boto3.client, bucket_name: str, prefix: str) -> Dict[Set[str], List[Tuple[str, str]]]:
     file_groups = defaultdict(list)
@@ -47,64 +45,46 @@ def group_files_by_columns(s3: boto3.client, bucket_name: str, prefix: str) -> D
 
     return file_groups
 
-def parse_group_map(
-    file_groups: Dict[Set[str], List[str]],
-) -> Dict[str, Dict[str, str]]:
-    result = {}
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        for column_set in file_groups.keys():
-            futures.append(executor.submit(process_column_set, column_set, file_groups))
-        
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            result[f"group{i+1}"] = future.result()
-    
-    return result
+def get_file_columns_s3_select(s3: boto3.client, bucket: str, key: str) -> Set[str]:
+    head = s3.head_object(Bucket=bucket, Key=key)
+    content_type = head.get('ContentType', '').lower()
 
-def process_column_set(column_set, file_groups):
-    return {
-        "columnNames": list(column_set),
-        "businessDates": [
-            business_date for business_date, _ in file_groups[column_set]
-        ],
-        "filePaths": [file_path for _, file_path in file_groups[column_set]],
+    input_serialization = {
+        "CSV": {"FileHeaderInfo": "Use"},
     }
 
-def get_file_columns_s3_select(s3: boto3.client, bucket: str, key: str) -> Tuple[str]:
-    # Get file content type
-    head = s3.head_object(Bucket=bucket, Key=key)
-    content_type = head.get('ContentType', '')
+    if 'gzip' in content_type:
+        input_serialization["CompressionType"] = "GZIP"
 
-    if 'csv' in content_type.lower():
-        return get_csv_columns(s3, bucket, key)
-    elif 'gzip' in content_type.lower():
-        return get_gzip_columns(s3, bucket, key)
-    else:
-        raise ValueError(f"Unsupported file type: {content_type}")
-
-def get_csv_columns(s3: boto3.client, bucket: str, key: str) -> Tuple[str]:
     response = s3.select_object_content(
         Bucket=bucket,
         Key=key,
         ExpressionType="SQL",
         Expression="SELECT * FROM s3object LIMIT 1",
-        InputSerialization={"CSV": {"FileHeaderInfo": "Use"}},
+        InputSerialization=input_serialization,
         OutputSerialization={"CSV": {}},
     )
+
     for event in response["Payload"]:
         if "Records" in event:
             content = event["Records"]["Payload"].decode("utf-8")
             reader = csv.reader(StringIO(content))
             header = next(reader)
-            return tuple(header)
-    return tuple()
+            return set(header)
+    return set()
 
-def get_gzip_columns(s3: boto3.client, bucket: str, key: str) -> Tuple[str]:
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    with gzip.GzipFile(fileobj=BytesIO(obj['Body'].read())) as gzipfile:
-        content = gzipfile.read().decode('utf-8')
-        reader = csv.reader(StringIO(content))
-        header = next(reader)
-        return tuple(header)
+def parse_group_map(file_groups: Dict[Set[str], List[Tuple[str, str]]]) -> Dict[str, Dict[str, List[str]]]:
+    result = {}
+    for i, (column_set, files) in enumerate(file_groups.items(), 1):
+        result[f"group{i}"] = {
+            "columnNames": list(column_set),
+            "businessDates": [business_date for business_date, _ in files],
+            "filePaths": [file_path for _, file_path in files],
+        }
+    return result
+
+def is_valid_date_format(folder_name: str) -> bool:
+    # Implement your date format validation logic here
+    pass
 
 ```
