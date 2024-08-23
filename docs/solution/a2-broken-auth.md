@@ -1,26 +1,35 @@
 ```
-def test_get_file_columns_s3_select_gzip(self):
-    mock_response = {
-        "Payload": [
-            {
-                "Records": {
-                    "Payload": b"col1,col2,col3\n"
-                }
-            }
-        ]
-    }
-    self.mock_s3_client.select_object_content.return_value = mock_response
-    
-    result = get_file_columns_s3_select(self.mock_s3_client, "test-bucket", "test.csv.gz")
-    
-    self.assertEqual(result, frozenset(["col1", "col2", "col3"]))
-    self.mock_s3_client.select_object_content.assert_called_once_with(
-        Bucket="test-bucket",
-        Key='test.csv.gz',
-        ExpressionType='SQL',
-        Expression='SELECT * FROM s3object LIMIT 1',
-        InputSerialization={'CSV': {'FileHeaderInfo': 'NONE'}, 'CompressionType': 'GZIP'},
-        OutputSerialization={'CSV': {}}
-    )
+import json
 
+def test_get_dataset_versions_handler_success(self):
+    event = {"queryStringParameters": {"datasetName": "test_dataset"}}
+    
+    with patch.dict(DATASET_TO_FILENAME_MAP, {
+        "test_dataset": {"fileName": "test.csv", "s3Prefix": "test_prefix"}
+    }), \
+    patch("src.ccbedac_api_orchestrator.handlers.publishing.dataset_versions.group_files_by_columns", return_value={
+        frozenset(["col1", "col2"]): [("20230101", "path/to/file1.csv")]
+    }):
+        result = get_dataset_versions_handler(self.mock_s3_client, event)
+    
+    self.assertEqual(result["statusCode"], 200)
+    
+    # Parse the JSON-encoded body
+    body = json.loads(result["body"])
+    
+    self.assertIn("Successfully retrieved 1 version(s)", body["message"])
+    self.assertIn("version1", body["body"])
+    
+    # Additional checks on the response structure
+    self.assertIsInstance(body["body"], dict)
+    self.assertIn("version1", body["body"])
+    self.assertIn("columnNames", body["body"]["version1"])
+    self.assertIn("businessDates", body["body"]["version1"])
+    self.assertIn("filePaths", body["body"]["version1"])
+    
+    # Check the content of version1
+    version1 = body["body"]["version1"]
+    self.assertEqual(set(version1["columnNames"]), {"col1", "col2"})
+    self.assertEqual(version1["businessDates"], ["20230101"])
+    self.assertEqual(version1["filePaths"], ["path/to/file1.csv"])
 ```
