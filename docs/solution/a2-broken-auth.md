@@ -1,12 +1,11 @@
 ```
-
 import unittest
-from unittest.mock import Mock, patch, call
-from io import StringIO
+from unittest.mock import Mock, patch
+import json
 from your_module import (
     get_dataset_versions_handler, group_files_by_columns, 
     get_file_columns_s3_select, parse_group_map, is_valid_date_format,
-    DATASET_TO_FILENAME_MAP, LANDING_ZONE_BUCKET, create_return_response
+    DATASET_TO_FILENAME_MAP, LANDING_ZONE_BUCKET
 )
 
 class TestDatasetVersionsHandler(unittest.TestCase):
@@ -24,22 +23,21 @@ class TestDatasetVersionsHandler(unittest.TestCase):
         }):
             result = get_dataset_versions_handler(self.mock_s3_client, event)
         
-        self.assertIn('statusCode', result)
-        self.assertIn('body', result)
         self.assertEqual(result['statusCode'], 200)
-        
-        body = result['body']
-        self.assertIn('message', body)
-        self.assertIn('body', body)
+        self.assertEqual(result['headers'], {'Content-Type': 'application/json'})
+        body = json.loads(result['body'])
+        self.assertEqual(body['statusCode'], 200)
         self.assertIn("Successfully retrieved 1 version(s)", body['message'])
-        
+        self.assertIsNotNone(body['body'])
+        self.assertIsNone(body['jobId'])
+        self.assertIsNone(body['errorData'])
+
         versions = body['body']
         self.assertIn("version1", versions)
         version1 = versions["version1"]
         self.assertIn("columnNames", version1)
         self.assertIn("businessDates", version1)
         self.assertIn("filePaths", version1)
-        
         self.assertEqual(set(version1["columnNames"]), {"col1", "col2"})
         self.assertEqual(version1["businessDates"], ["20230101"])
         self.assertEqual(version1["filePaths"], ["path/to/file1.csv"])
@@ -50,7 +48,13 @@ class TestDatasetVersionsHandler(unittest.TestCase):
         result = get_dataset_versions_handler(self.mock_s3_client, event)
         
         self.assertEqual(result['statusCode'], 400)
-        self.assertIn("Invalid Dataset name", result['body']['message'])
+        self.assertEqual(result['headers'], {'Content-Type': 'application/json'})
+        body = json.loads(result['body'])
+        self.assertEqual(body['statusCode'], 400)
+        self.assertIn("Invalid Dataset name", body['message'])
+        self.assertIsNone(body['body'])
+        self.assertIsNone(body['jobId'])
+        self.assertIsNotNone(body['errorData'])
 
     def test_get_dataset_versions_handler_no_files_found(self):
         event = {"queryStringParameters": {"datasetName": "test_dataset"}}
@@ -62,7 +66,13 @@ class TestDatasetVersionsHandler(unittest.TestCase):
             result = get_dataset_versions_handler(self.mock_s3_client, event)
         
         self.assertEqual(result['statusCode'], 404)
-        self.assertIn("No files found", result['body']['message'])
+        self.assertEqual(result['headers'], {'Content-Type': 'application/json'})
+        body = json.loads(result['body'])
+        self.assertEqual(body['statusCode'], 404)
+        self.assertEqual(body['message'], "No files found in test_prefix for test_dataset, please check logs for details")
+        self.assertIsNone(body['body'])
+        self.assertIsNone(body['jobId'])
+        self.assertIsNone(body['errorData'])
 
     def test_get_dataset_versions_handler_unhandled_exception(self):
         event = {"queryStringParameters": {"datasetName": "test_dataset"}}
@@ -74,9 +84,13 @@ class TestDatasetVersionsHandler(unittest.TestCase):
             result = get_dataset_versions_handler(self.mock_s3_client, event)
         
         self.assertEqual(result['statusCode'], 500)
-        self.assertEqual(result['body']['message'], "Internal server error")
-        self.assertIn("error", result['body'])
-        self.assertIn("Exception: Unhandled error", result['body']['error_data'])
+        self.assertEqual(result['headers'], {'Content-Type': 'application/json'})
+        body = json.loads(result['body'])
+        self.assertEqual(body['statusCode'], 500)
+        self.assertEqual(body['message'], "Internal server error")
+        self.assertIsNone(body['body'])
+        self.assertIsNone(body['jobId'])
+        self.assertIsNotNone(body['errorData'])
 
     def test_group_files_by_columns(self):
         self.mock_s3_client.get_paginator.return_value.paginate.return_value = [
@@ -175,18 +189,8 @@ class TestDatasetVersionsHandler(unittest.TestCase):
         self.assertFalse(is_valid_date_format("20230132"))  # Invalid day
         self.assertFalse(is_valid_date_format("not-a-date"))
 
-    def test_create_return_response(self):
-        result = create_return_response(200, "Success", {"data": "test"}, "job123", "No error")
-        
-        self.assertIn('statusCode', result)
-        self.assertIn('body', result)
-        self.assertEqual(result['statusCode'], 200)
-        self.assertEqual(result['body']['message'], "Success")
-        self.assertEqual(result['body']['body'], {"data": "test"})
-        self.assertEqual(result['body']['job_id'], "job123")
-        self.assertEqual(result['body']['error_data'], "No error")
-
 if __name__ == '__main__':
     unittest.main()
+
 
 ```
