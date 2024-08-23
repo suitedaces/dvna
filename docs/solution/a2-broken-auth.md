@@ -25,6 +25,7 @@ class TestDatasetVersionsHandler(unittest.TestCase):
         
         self.assertEqual(result["statusCode"], 200)
         self.assertIn("Successfully retrieved 1 version(s)", result["body"]["message"])
+        self.assertIn("version1", result["body"]["body"])
 
     def test_get_dataset_versions_handler_invalid_dataset(self):
         event = {"queryStringParameters": {"datasetName": "invalid_dataset"}}
@@ -176,14 +177,14 @@ class TestDatasetVersionsHandler(unittest.TestCase):
         result = parse_group_map(input_map)
         
         self.assertEqual(len(result), 2)
-        self.assertIn("group1", result)
-        self.assertIn("group2", result)
-        self.assertEqual(result["group1"]["columnNames"], ["col1", "col2"])
-        self.assertEqual(result["group1"]["businessDates"], ["2023-01-01", "2023-01-02"])
-        self.assertEqual(result["group1"]["filePaths"], ["path/to/file1.csv", "path/to/file2.csv"])
-        self.assertEqual(result["group2"]["columnNames"], ["col1", "col2", "col3"])
-        self.assertEqual(result["group2"]["businessDates"], ["2023-01-03"])
-        self.assertEqual(result["group2"]["filePaths"], ["path/to/file3.csv"])
+        self.assertIn("version1", result)
+        self.assertIn("version2", result)
+        self.assertEqual(result["version1"]["columnNames"], ["col1", "col2"])
+        self.assertEqual(result["version1"]["businessDates"], ["2023-01-01", "2023-01-02"])
+        self.assertEqual(result["version1"]["filePaths"], ["path/to/file1.csv", "path/to/file2.csv"])
+        self.assertEqual(result["version2"]["columnNames"], ["col1", "col2", "col3"])
+        self.assertEqual(result["version2"]["businessDates"], ["2023-01-03"])
+        self.assertEqual(result["version2"]["filePaths"], ["path/to/file3.csv"])
 
     def test_is_valid_date_format(self):
         self.assertTrue(is_valid_date_format("2023-01-01"))
