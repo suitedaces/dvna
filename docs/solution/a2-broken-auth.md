@@ -1,118 +1,209 @@
 ```
-
-import concurrent.futures
-import boto3
-import csv
+import unittest
+from unittest.mock import Mock, patch, call
 from io import StringIO
-from typing import Dict, List, Tuple, Set, FrozenSet
-from collections import defaultdict
+from your_module import (
+    get_dataset_versions_handler, group_files_by_columns, 
+    get_file_columns_s3_select, parse_group_map, is_valid_date_format,
+    DATASET_TO_FILENAME_MAP, LANDING_ZONE_BUCKET, create_return_response
+)
 
-# Configure boto3 to use max connections
-s3_client = boto3.client('s3', config=boto3.session.Config(max_pool_connections=100))
+class TestDatasetVersionsHandler(unittest.TestCase):
+    def setUp(self):
+        self.mock_s3_client = Mock()
 
-def group_files_by_columns(bucket_name: str, prefix: str, dataset_file_name: str) -> Dict[FrozenSet[str], List[Tuple[str, str]]]:
-    file_groups = defaultdict(list)
-    logger.info(f"Processing prefix: {prefix}")
-    paginator = s3_client.get_paginator("list_objects_v2")
+    def test_get_dataset_versions_handler_success(self):
+        event = {"queryStringParameters": {"datasetName": "test_dataset"}}
+        
+        with patch.dict(DATASET_TO_FILENAME_MAP, {
+            "test_dataset": {"fileName": "test.csv", "s3Prefix": "test_prefix"}
+        }), \
+        patch("your_module.group_files_by_columns", return_value={
+            frozenset(["col1", "col2"]): [("2023-01-01", "path/to/file1.csv")]
+        }):
+            result = get_dataset_versions_handler(self.mock_s3_client, event)
+        
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("Successfully retrieved 1 version(s)", result["body"]["message"])
 
-    def process_file(bucket: str, key: str, folder_name: str):
-        try:
-            column_set = get_file_columns_s3_select(bucket, key)
-            if column_set:
-                return column_set, (folder_name, key)
-        except Exception as e:
-            logger.error(f"Error processing file {key}: {str(e)}")
-        return None
+    def test_get_dataset_versions_handler_invalid_dataset(self):
+        event = {"queryStringParameters": {"datasetName": "invalid_dataset"}}
+        
+        result = get_dataset_versions_handler(self.mock_s3_client, event)
+        
+        self.assertEqual(result["statusCode"], 400)
+        self.assertIn("Invalid Dataset name", result["body"]["message"])
 
-    def process_prefix(prefix_data):
-        folder_name = prefix_data.get("Prefix", "").split("/")[-2]
-        if not is_valid_date_format(folder_name):
-            return []
+    def test_get_dataset_versions_handler_no_files_found(self):
+        event = {"queryStringParameters": {"datasetName": "test_dataset"}}
+        
+        with patch.dict(DATASET_TO_FILENAME_MAP, {
+            "test_dataset": {"fileName": "test.csv", "s3Prefix": "test_prefix"}
+        }), \
+        patch("your_module.group_files_by_columns", return_value={}):
+            result = get_dataset_versions_handler(self.mock_s3_client, event)
+        
+        self.assertEqual(result["statusCode"], 404)
+        self.assertIn("No files found", result["body"]["message"])
 
-        data_prefix = prefix_data.get("Prefix")
-        try:
-            response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=data_prefix)
-            if "Contents" not in response:
-                return []
+    def test_get_dataset_versions_handler_unhandled_exception(self):
+        event = {"queryStringParameters": {"datasetName": "test_dataset"}}
+        
+        with patch.dict(DATASET_TO_FILENAME_MAP, {
+            "test_dataset": {"fileName": "test.csv", "s3Prefix": "test_prefix"}
+        }), \
+        patch("your_module.group_files_by_columns", side_effect=Exception("Unhandled error")):
+            result = get_dataset_versions_handler(self.mock_s3_client, event)
+        
+        self.assertEqual(result["statusCode"], 500)
+        self.assertEqual(result["body"]["message"], "Internal server error")
 
-            objects_to_process = [
-                obj for obj in response["Contents"]
-                if obj["Key"].split("/")[-1] == dataset_file_name
-            ]
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as file_executor:
-                file_futures = [
-                    file_executor.submit(process_file, bucket_name, obj["Key"], folder_name)
-                    for obj in objects_to_process
+    def test_group_files_by_columns(self):
+        self.mock_s3_client.get_paginator.return_value.paginate.return_value = [
+            {
+                "CommonPrefixes": [
+                    {"Prefix": "test_prefix/2023-01-01/"},
+                    {"Prefix": "test_prefix/invalid_date/"},
+                    {"Prefix": "test_prefix/2023-01-02/"}
                 ]
-                results = []
-                for future in concurrent.futures.as_completed(file_futures):
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                
-                return results
+            }
+        ]
+        self.mock_s3_client.list_objects_v2.side_effect = [
+            {
+                "Contents": [
+                    {"Key": "test_prefix/2023-01-01/test.csv"},
+                    {"Key": "test_prefix/2023-01-01/other.csv"}
+                ]
+            },
+            {},  # No contents for invalid_date
+            {
+                "Contents": [
+                    {"Key": "test_prefix/2023-01-02/test.csv"}
+                ]
+            }
+        ]
+        
+        with patch("your_module.get_file_columns_s3_select") as mock_get_columns:
+            mock_get_columns.side_effect = [
+                frozenset(["col1", "col2"]),
+                frozenset(["col1", "col2", "col3"])
+            ]
+            
+            result = group_files_by_columns(self.mock_s3_client, LANDING_ZONE_BUCKET, "test_prefix", "test.csv")
+        
+        self.assertEqual(len(result), 2)
+        self.assertIn(frozenset(["col1", "col2"]), result)
+        self.assertIn(frozenset(["col1", "col2", "col3"]), result)
 
-        except Exception as e:
-            logger.error(f"Error processing prefix {data_prefix}: {str(e)}")
-            return []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as prefix_executor:
-        prefix_futures = []
-        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix, Delimiter="/"):
-            for prefix_data in page.get("CommonPrefixes", []):
-                prefix_futures.append(prefix_executor.submit(process_prefix, prefix_data))
-
-        for future in concurrent.futures.as_completed(prefix_futures):
-            try:
-                results = future.result()
-                for column_set, file_info in results:
-                    file_groups[column_set].append(file_info)
-            except Exception as e:
-                logger.error(f"Error processing future: {str(e)}")
-
-    return file_groups
-
-def get_file_columns_s3_select(bucket: str, key: str) -> FrozenSet[str]:
-    try:
-        input_serialization = {
-            "CSV": {"FileHeaderInfo": "NONE"},
+    def test_group_files_by_columns_error_handling(self):
+        self.mock_s3_client.get_paginator.return_value.paginate.return_value = [
+            {
+                "CommonPrefixes": [
+                    {"Prefix": "test_prefix/2023-01-01/"}
+                ]
+            }
+        ]
+        self.mock_s3_client.list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": "test_prefix/2023-01-01/test.csv"}
+            ]
         }
-        if key.lower().endswith('.gz'):
-            input_serialization["CompressionType"] = "GZIP"
+        
+        with patch("your_module.get_file_columns_s3_select", side_effect=Exception("Error processing file")):
+            result = group_files_by_columns(self.mock_s3_client, LANDING_ZONE_BUCKET, "test_prefix", "test.csv")
+        
+        self.assertEqual(len(result), 0)
 
-        response = s3_client.select_object_content(
-            Bucket=bucket,
-            Key=key,
-            ExpressionType="SQL",
+    def test_get_file_columns_s3_select_csv(self):
+        self.mock_s3_client.select_object_content.return_value = {
+            "Payload": [
+                {
+                    "Records": {
+                        "Payload": b"col1,col2\n"
+                    }
+                }
+            ]
+        }
+        
+        result = get_file_columns_s3_select(self.mock_s3_client, "test-bucket", "test.csv")
+        
+        self.assertEqual(result, frozenset(["col1", "col2"]))
+
+    def test_get_file_columns_s3_select_gzip(self):
+        self.mock_s3_client.select_object_content.return_value = {
+            "Payload": [
+                {
+                    "Records": {
+                        "Payload": b"col1,col2,col3\n"
+                    }
+                }
+            ]
+        }
+        
+        result = get_file_columns_s3_select(self.mock_s3_client, "test-bucket", "test.csv.gz")
+        
+        self.assertEqual(result, frozenset(["col1", "col2", "col3"]))
+        self.mock_s3_client.select_object_content.assert_called_with(
+            Bucket="test-bucket",
+            Key="test.csv.gz",
             Expression="SELECT * FROM s3object LIMIT 1",
-            InputSerialization=input_serialization,
-            OutputSerialization={"CSV": {}},
+            InputSerialization={"CSV": {"FileHeaderInfo": "NONE"}, "CompressionType": "GZIP"},
+            OutputSerialization={"CSV": {}}
         )
 
-        for event in response["Payload"]:
-            if "Records" in event:
-                content = event["Records"]["Payload"].decode("utf-8")
-                reader = csv.reader(StringIO(content))
-                return frozenset(next(reader))
-        
-        return frozenset()
-    except Exception as e:
-        logger.error(f"Error reading columns from {key}: {str(e)}")
-        return frozenset()
-
-def parse_group_map(file_groups: Dict[FrozenSet[str], List[Tuple[str, str]]]) -> Dict[str, Dict[str, List[str]]]:
-    return {
-        f"group{i}": {
-            "columnNames": list(column_set),
-            "businessDates": [business_date for business_date, _ in files],
-            "filePaths": [file_path for _, file_path in files],
+    def test_get_file_columns_s3_select_no_records(self):
+        self.mock_s3_client.select_object_content.return_value = {
+            "Payload": []
         }
-        for i, (column_set, files) in enumerate(file_groups.items(), 1)
-    }
+        
+        result = get_file_columns_s3_select(self.mock_s3_client, "test-bucket", "test.csv")
+        
+        self.assertEqual(result, frozenset())
 
-def is_valid_date_format(folder_name: str) -> bool:
-    # Implement your date format validation logic here
-    pass
+    def test_get_file_columns_s3_select_error(self):
+        self.mock_s3_client.select_object_content.side_effect = Exception("S3 Select error")
+        
+        result = get_file_columns_s3_select(self.mock_s3_client, "test-bucket", "test.csv")
+        
+        self.assertEqual(result, frozenset())
+
+    def test_parse_group_map(self):
+        input_map = {
+            frozenset(["col1", "col2"]): [("2023-01-01", "path/to/file1.csv"), ("2023-01-02", "path/to/file2.csv")],
+            frozenset(["col1", "col2", "col3"]): [("2023-01-03", "path/to/file3.csv")]
+        }
+        
+        result = parse_group_map(input_map)
+        
+        self.assertEqual(len(result), 2)
+        self.assertIn("group1", result)
+        self.assertIn("group2", result)
+        self.assertEqual(result["group1"]["columnNames"], ["col1", "col2"])
+        self.assertEqual(result["group1"]["businessDates"], ["2023-01-01", "2023-01-02"])
+        self.assertEqual(result["group1"]["filePaths"], ["path/to/file1.csv", "path/to/file2.csv"])
+        self.assertEqual(result["group2"]["columnNames"], ["col1", "col2", "col3"])
+        self.assertEqual(result["group2"]["businessDates"], ["2023-01-03"])
+        self.assertEqual(result["group2"]["filePaths"], ["path/to/file3.csv"])
+
+    def test_is_valid_date_format(self):
+        self.assertTrue(is_valid_date_format("2023-01-01"))
+        self.assertTrue(is_valid_date_format("2023-12-31"))
+        self.assertFalse(is_valid_date_format("2023-13-01"))
+        self.assertFalse(is_valid_date_format("2023-01-32"))
+        self.assertFalse(is_valid_date_format("not-a-date"))
+
+    def test_create_return_response(self):
+        response = create_return_response(200, "Success", {"key": "value"})
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(response["body"]["message"], "Success")
+        self.assertEqual(response["body"]["body"], {"key": "value"})
+
+        error_response = create_return_response(400, "Bad Request", error_data="Invalid input")
+        self.assertEqual(error_response["statusCode"], 400)
+        self.assertEqual(error_response["body"]["message"], "Bad Request")
+        self.assertEqual(error_response["body"]["error_data"], "Invalid input")
+
+if __name__ == '__main__':
+    unittest.main()
 
 ```
